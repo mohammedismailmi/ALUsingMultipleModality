@@ -1,0 +1,445 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset, Dataset
+import torchvision
+import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+import random
+from tqdm import tqdm
+import copy
+import time
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+class EfficientCNN(nn.Module):
+    """
+    Efficient CNN architecture with residual connections and batch normalization
+    Designed for better performance on CIFAR-10
+    """
+    def __init__(self, num_classes=10, dropout_rate=0.3):
+        super(EfficientCNN, self).__init__()
+
+        # First block
+        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 64, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+
+        # Second block
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 128, 3, padding=1)
+        self.bn4 = nn.BatchNorm2d(128)
+
+        # Third block
+        self.conv5 = nn.Conv2d(128, 256, 3, padding=1)
+        self.bn5 = nn.BatchNorm2d(256)
+        self.conv6 = nn.Conv2d(256, 256, 3, padding=1)
+        self.bn6 = nn.BatchNorm2d(256)
+
+        # Fourth block
+        self.conv7 = nn.Conv2d(256, 512, 3, padding=1)
+        self.bn7 = nn.BatchNorm2d(512)
+        self.conv8 = nn.Conv2d(512, 512, 3, padding=1)
+        self.bn8 = nn.BatchNorm2d(512)
+
+        # Global average pooling and classifier
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        # Block 1
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.max_pool2d(x, 2)
+
+        # Block 2
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = F.max_pool2d(x, 2)
+
+        # Block 3
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.relu(self.bn6(self.conv6(x)))
+        x = F.max_pool2d(x, 2)
+
+        # Block 4
+        x = F.relu(self.bn7(self.conv7(x)))
+        x = F.relu(self.bn8(self.conv8(x)))
+        x = F.max_pool2d(x, 2)
+
+        # Global average pooling and classification
+        x = self.global_avg_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.dropout(x)
+        x = self.fc(x)
+
+        return x
+
+class ActiveLearningPipeline:
+    """
+    Active Learning Pipeline with entropy-based uncertainty sampling
+    Fixed to run exactly 10 cycles with 1000 samples per cycle
+    """
+    def __init__(self, dataset, test_dataset, initial_samples=1000, query_samples=1000,
+                 num_cycles=10, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.device = device
+        self.dataset = dataset
+        self.test_dataset = test_dataset
+        self.initial_samples = initial_samples
+        self.query_size = query_samples
+        self.num_cycles = num_cycles
+        self.max_budget = initial_samples + (num_cycles - 1) * query_samples
+
+        # Initialize labeled and unlabeled indices
+        self.all_indices = list(range(len(dataset)))
+        self.labeled_indices = random.sample(self.all_indices, initial_samples)
+        self.unlabeled_indices = [i for i in self.all_indices if i not in self.labeled_indices]
+
+        # Results tracking
+        self.results = {
+            'labeled_samples': [],
+            'test_accuracies': [],
+            'train_accuracies': [],
+            'training_times': [],
+            'query_times': [],
+            'entropy_stats': []
+        }
+
+    def create_data_loaders(self, batch_size=128):
+        """Create data loaders for labeled and unlabeled data"""
+        labeled_dataset = Subset(self.dataset, self.labeled_indices)
+        unlabeled_dataset = Subset(self.dataset, self.unlabeled_indices)
+
+        labeled_loader = DataLoader(labeled_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+        unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+        test_loader = DataLoader(self.test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+        return labeled_loader, unlabeled_loader, test_loader
+
+    def train_model(self, model, train_loader, epochs=50, lr=0.001):
+        """Train the model with advanced techniques"""
+        start_time = time.time()
+        
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+        model.train()
+        best_loss = float('inf')
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            running_loss = 0.0
+            correct = 0
+            total = 0
+
+            # Use tqdm for progress bar
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=False)
+            
+            for batch_idx, (data, target) in enumerate(pbar):
+                data, target = data.to(self.device), target.to(self.device)
+
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                _, predicted = output.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{100.*correct/total:.2f}%'
+                })
+
+            epoch_loss = running_loss / len(train_loader)
+            epoch_acc = 100. * correct / total
+            scheduler.step(epoch_loss)
+
+            # Early stopping
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= 10:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+            if epoch % 10 == 0:
+                print(f'Epoch {epoch}: Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.2f}%')
+
+        training_time = time.time() - start_time
+        return epoch_acc, training_time
+
+    def evaluate_model(self, model, test_loader):
+        """Evaluate model on test set"""
+        model.eval()
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for data, target in tqdm(test_loader, desc='Evaluating', leave=False):
+                data, target = data.to(self.device), target.to(self.device)
+                outputs = model(data)
+                _, predicted = outputs.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
+
+        accuracy = 100. * correct / total
+        return accuracy
+
+    def calculate_entropy(self, model, unlabeled_loader):
+        """Calculate entropy-based uncertainty for unlabeled samples"""
+        start_time = time.time()
+        
+        model.eval()
+        entropies = []
+        indices = []
+
+        with torch.no_grad():
+            for batch_idx, (data, _) in enumerate(tqdm(unlabeled_loader, desc='Computing entropy', leave=False)):
+                data = data.to(self.device)
+                outputs = model(data)
+                probabilities = F.softmax(outputs, dim=1)
+
+                # Calculate entropy for each sample
+                entropy = -torch.sum(probabilities * torch.log(probabilities + 1e-8), dim=1)
+                entropies.extend(entropy.cpu().numpy())
+
+                # Track original indices
+                batch_start = batch_idx * unlabeled_loader.batch_size
+                batch_end = min(batch_start + unlabeled_loader.batch_size, len(self.unlabeled_indices))
+                indices.extend(range(batch_start, batch_end))
+
+        query_time = time.time() - start_time
+        return np.array(entropies), indices, query_time
+
+    def query_samples(self, model, unlabeled_loader):
+        """Query most uncertain samples using entropy-based sampling"""
+        entropies, batch_indices, query_time = self.calculate_entropy(model, unlabeled_loader)
+
+        # Get indices of samples with highest entropy
+        most_uncertain_batch_indices = np.argsort(entropies)[-self.query_size:]
+
+        # Convert batch indices to actual dataset indices
+        queried_indices = [self.unlabeled_indices[i] for i in most_uncertain_batch_indices]
+
+        # Update labeled and unlabeled sets
+        self.labeled_indices.extend(queried_indices)
+        self.unlabeled_indices = [i for i in self.unlabeled_indices if i not in queried_indices]
+
+        # Calculate entropy statistics
+        entropy_stats = {
+            'mean': np.mean(entropies),
+            'std': np.std(entropies),
+            'min': np.min(entropies),
+            'max': np.max(entropies),
+            'queried_mean': np.mean(entropies[most_uncertain_batch_indices])
+        }
+
+        print(f"Queried {len(queried_indices)} samples")
+        print(f"Avg entropy (all): {entropy_stats['mean']:.4f}")
+        print(f"Avg entropy (queried): {entropy_stats['queried_mean']:.4f}")
+        
+        return query_time, entropy_stats
+
+    def run_active_learning(self):
+        """Run the complete active learning pipeline for exactly 10 cycles"""
+        print("Starting Active Learning Pipeline...")
+        print(f"Device: {self.device}")
+        print(f"Initial labeled samples: {len(self.labeled_indices)}")
+        print(f"Query samples per cycle: {self.query_size}")
+        print(f"Number of cycles: {self.num_cycles}")
+        print(f"Final budget: {self.max_budget}")
+        print("-" * 60)
+
+        for cycle in range(self.num_cycles):
+            print(f"\n{'='*20} CYCLE {cycle + 1}/{self.num_cycles} {'='*20}")
+            print(f"Current labeled samples: {len(self.labeled_indices)}")
+            print(f"Remaining unlabeled samples: {len(self.unlabeled_indices)}")
+
+            # Create data loaders
+            labeled_loader, unlabeled_loader, test_loader = self.create_data_loaders()
+
+            # Initialize and train model
+            model = EfficientCNN(num_classes=10).to(self.device)
+            print("Training model...")
+            train_acc, training_time = self.train_model(model, labeled_loader, epochs=60)
+
+            # Evaluate on test set
+            print("Evaluating model...")
+            test_acc = self.evaluate_model(model, test_loader)
+            print(f"Train Accuracy: {train_acc:.2f}%")
+            print(f"Test Accuracy: {test_acc:.2f}%")
+            print(f"Training Time: {training_time:.2f}s")
+
+            # Store results
+            self.results['labeled_samples'].append(len(self.labeled_indices))
+            self.results['train_accuracies'].append(train_acc)
+            self.results['test_accuracies'].append(test_acc)
+            self.results['training_times'].append(training_time)
+
+            # Query new samples if not the last cycle
+            if cycle < self.num_cycles - 1:
+                print("Querying most uncertain samples...")
+                query_time, entropy_stats = self.query_samples(model, unlabeled_loader)
+                self.results['query_times'].append(query_time)
+                self.results['entropy_stats'].append(entropy_stats)
+                print(f"Query Time: {query_time:.2f}s")
+            else:
+                self.results['query_times'].append(0)  # No querying in last cycle
+                self.results['entropy_stats'].append({})
+
+        print("\n" + "="*60)
+        print("ACTIVE LEARNING COMPLETE!")
+        print("="*60)
+        print(f"Final labeled samples: {len(self.labeled_indices)}")
+        print(f"Final test accuracy: {self.results['test_accuracies'][-1]:.2f}%")
+        print(f"Total training time: {sum(self.results['training_times']):.2f}s")
+        print(f"Total query time: {sum(self.results['query_times']):.2f}s")
+
+        return self.results
+
+    def plot_results(self):
+        """Plot comprehensive active learning results"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+        # Plot 1: Accuracy vs labeled samples
+        axes[0, 0].plot(self.results['labeled_samples'], self.results['train_accuracies'],
+                       'b-o', label='Train Accuracy', linewidth=2, markersize=6)
+        axes[0, 0].plot(self.results['labeled_samples'], self.results['test_accuracies'],
+                       'r-o', label='Test Accuracy', linewidth=2, markersize=6)
+        axes[0, 0].set_xlabel('Number of Labeled Samples')
+        axes[0, 0].set_ylabel('Accuracy (%)')
+        axes[0, 0].set_title('Active Learning Progress')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # Plot 2: Accuracy improvement per cycle
+        cycles = list(range(1, len(self.results['test_accuracies']) + 1))
+        axes[0, 1].plot(cycles, self.results['test_accuracies'], 'g-o', linewidth=2, markersize=6)
+        axes[0, 1].set_xlabel('Active Learning Cycle')
+        axes[0, 1].set_ylabel('Test Accuracy (%)')
+        axes[0, 1].set_title('Test Accuracy per Cycle')
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # Plot 3: Training times
+        axes[1, 0].bar(cycles, self.results['training_times'], color='skyblue', alpha=0.7)
+        axes[1, 0].set_xlabel('Cycle')
+        axes[1, 0].set_ylabel('Training Time (seconds)')
+        axes[1, 0].set_title('Training Time per Cycle')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # Plot 4: Entropy statistics
+        if self.results['entropy_stats']:
+            mean_entropies = [stats.get('mean', 0) for stats in self.results['entropy_stats'][:-1]]  # Exclude last empty dict
+            queried_entropies = [stats.get('queried_mean', 0) for stats in self.results['entropy_stats'][:-1]]
+            
+            x = list(range(1, len(mean_entropies) + 1))
+            axes[1, 1].plot(x, mean_entropies, 'purple', marker='s', label='Mean Entropy', linewidth=2)
+            axes[1, 1].plot(x, queried_entropies, 'orange', marker='^', label='Queried Mean Entropy', linewidth=2)
+            axes[1, 1].set_xlabel('Query Cycle')
+            axes[1, 1].set_ylabel('Entropy')
+            axes[1, 1].set_title('Entropy Statistics')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+# Data preparation with advanced augmentation
+def get_cifar10_data():
+    """Load CIFAR-10 dataset with advanced data augmentation"""
+
+    # Advanced training transforms
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    # Test transforms (no augmentation)
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    # Load datasets
+    train_dataset = torchvision.datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=train_transform
+    )
+    test_dataset = torchvision.datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=test_transform
+    )
+
+    return train_dataset, test_dataset
+
+def main():
+    """Main function to run the active learning pipeline"""
+    print("Loading CIFAR-10 dataset...")
+    train_dataset, test_dataset = get_cifar10_data()
+
+    # Initialize active learning pipeline for exactly 10 cycles
+    al_pipeline = ActiveLearningPipeline(
+        dataset=train_dataset,
+        test_dataset=test_dataset,
+        initial_samples=1000,      # Start with 1000 labeled samples
+        query_samples=1000,        # Query 1000 samples per cycle
+        num_cycles=10              # Run exactly 10 cycles
+    )
+
+    # Run active learning
+    results = al_pipeline.run_active_learning()
+
+    # Plot results
+    al_pipeline.plot_results()
+
+    # Print detailed summary
+    print("\n" + "="*70)
+    print("DETAILED ACTIVE LEARNING SUMMARY")
+    print("="*70)
+    print(f"{'Cycle':<6} {'Samples':<8} {'Test Acc':<10} {'Train Time':<12} {'Query Time':<12}")
+    print("-" * 70)
+    
+    for i in range(len(results['labeled_samples'])):
+        cycle = i + 1
+        samples = results['labeled_samples'][i]
+        test_acc = results['test_accuracies'][i]
+        train_time = results['training_times'][i]
+        query_time = results['query_times'][i] if i < len(results['query_times']) else 0
+        
+        print(f"{cycle:<6} {samples:<8} {test_acc:<10.2f} {train_time:<12.2f} {query_time:<12.2f}")
+
+    improvement = results['test_accuracies'][-1] - results['test_accuracies'][0]
+    avg_improvement = improvement / (len(results['labeled_samples']) - 1)
+    
+    print("-" * 70)
+    print(f"Total improvement: {improvement:.2f}%")
+    print(f"Average improvement per cycle: {avg_improvement:.2f}%")
+    print(f"Total training time: {sum(results['training_times']):.2f}s")
+    print(f"Total query time: {sum(results['query_times']):.2f}s")
+    
+    # Efficiency metrics
+    final_samples = results['labeled_samples'][-1]
+    final_accuracy = results['test_accuracies'][-1]
+    print(f"Sample efficiency: {final_accuracy/final_samples*1000:.3f}% per 1000 samples")
+
+if __name__ == "__main__":
+    main()
