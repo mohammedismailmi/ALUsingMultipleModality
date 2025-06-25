@@ -332,25 +332,26 @@ def load_and_prepare_cifar10(max_samples=10000):
 
 def main():
     """Main function to run active learning experiment"""
-    # Load data
-    x_train, y_train, x_val, y_val, x_test, y_test = load_and_prepare_cifar10(max_samples=10000)
+    # Load data (use a bigger sample size if available)
+    x_train, y_train, x_val, y_val, x_test, y_test = load_and_prepare_cifar10(max_samples=60000)
     
     # Create active learning instance
     al_model = ActiveLearningVGG16()
     
-    # Run active learning loop
+    # Run active learning loop with updated config
     results = al_model.active_learning_loop(
         x_train, y_train, x_val, y_val, x_test, y_test,
-        initial_samples=1000,      # Start with 1000 samples
-        samples_per_iteration=500,  # Add 500 samples per iteration
-        max_iterations=10,         # Run for 10 iterations
-        epochs_per_iteration=15    # Train for 15 epochs per iteration
+        initial_samples=10000,         # Start with 10,000 samples
+        samples_per_iteration=5000,    # Add 5,000 samples per iteration
+        max_iterations=9,             # Run for 9 iterations
+        epochs_per_iteration=15
     )
     
     print("\n=== Experiment Complete ===")
     print("Results saved in 'results' DataFrame")
     
     return results
+
 
 if __name__ == "__main__":
     # Run the experiment
